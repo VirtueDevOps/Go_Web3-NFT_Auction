@@ -1,0 +1,289 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"fmt"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ipfs/go-cid"
+	ipfs "github.com/ipfs/go-ipfs-api"
+	"github.com/libp2p/go-libp2p-core/peer"
+)
+
+const (
+	NFTContractAddress  = "0x1234567890abcdef" // Replace with actual NFT contract address
+	VirtueTokenAddress  = "0x1234567890abcdef" // Replace with actual VirtueToken contract address
+	AuctionContractAddr = "0x1234567890abcdef" // Replace with actual auction contract address
+	IPFSHost            = "127.0.0.1"          // Replace with actual IPFS host
+	IPFSPort            = "5001"               // Replace with actual IPFS port
+)
+
+// NFT is a struct representing an NFT
+type NFT struct {
+	ID          string
+	Attributes  map[string]string
+	ImageCID    cid.Cid
+	Owner       common.Address
+	VirtueToken common.Address
+}
+
+// Bid is a struct representing a bid in the auction
+type Bid struct {
+	Bidder   common.Address
+	BidValue *big.Int
+	Timestamp int64
+}
+
+// NFTContract is the ABI for the NFT contract
+var NFTContract = abi.ABI{
+	// Define methods and events for the NFT contract here
+}
+
+// VirtueTokenContract is the ABI for the VirtueToken contract
+var VirtueTokenContract = abi.ABI{
+	// Define methods and events for the VirtueToken contract here
+}
+
+// AuctionContract is the ABI for the auction contract
+var AuctionContract = abi.ABI{
+	// Define methods and events for the auction contract here
+}
+
+func main() {
+	client, err := ethclient.Dial("ws://localhost:8546") // Replace with actual Ethereum RPC endpoint
+	if err != nil {
+		fmt.Printf("Error connecting to Ethereum RPC endpoint: %v\n", err)
+		return
+	}
+
+	// Connect to IPFS
+	ipfs := ipfs.NewShell(IPFSHost, IPFSPort)
+
+	// Load NFT contract
+	nftContract, err := NewNFTContract(common.HexToAddress(NFTContractAddress), client)
+	if err != nil {
+		fmt.Printf("Error connecting to New NFT Contract: %v\n", err)
+		return
+	}
+
+	// Load VirtueToken contract
+	virtueTokenContract, err := NewVirtueTokenContract(common.HexToAddress(VirtueTokenAddress), client)
+	if err != nil {
+		fmt.Printf("Error loading VirtueToken contract: %v\n", err)
+		return
+	}
+
+	// Load auction contract
+	auctionContract, err := NewAuctionContract(common.HexToAddress(AuctionContractAddr), client)
+	if err != nil {
+		fmt.Printf("Error loading auction contract: %v\n", err)
+		return
+	}
+
+	// Watch for new NFTs being minted
+	mintedNFTsCh := make(chan *NFTContractMinted)
+	mintedNFTsSub, err := nftContract.WatchMinted(nil, mintedNFTsCh)
+	if err != nil {
+		fmt.Printf("Error subscribing to NFT minted events: %v\n", err)
+		return
+	}
+	defer mintedNFTsSub.Unsubscribe()
+	go func() {
+		for {
+			select {
+			case mintedNFT := <-mintedNFTsCh:
+				// Add NFT to auction contract
+				nft := &NFT{
+					ID:          mintedNFT.ID.String(),
+					Attributes:  mintedNFT.Attributes,
+					ImageCID:    mintedNFT.ImageCID,
+					Owner:       mintedNFT.Owner,
+					VirtueToken: mintedNFT.VirtueToken,
+				}
+				if err := addNFTToAuction(nft, auctionContract, client); err != nil {
+					fmt.Printf("Error adding NFT to auction contract: %v\n", err)
+				}
+			case <-mintedNFTsSub.Err():
+				return
+			}
+		}
+	}()
+
+	// Watch for new bids
+	bidsCh := make(chan *AuctionContractBid)
+	bidsSub, err := auctionContract.WatchBid(nil, bidsCh)
+	if err != nil {
+		fmt.Printf("Error subscribing to bid events: %v\n", err)
+		return
+	}
+	defer bidsSub.Unsubscribe()
+	go func() {
+		for {
+			select {
+			case bid := <-bidsCh:
+				// Update bid in auction contract
+				if err := updateBid(bid, auctionContract, client); err != nil {
+					fmt.Printf("Error updating bid: %v\n", err)
+				}
+			case <-bidsSub.Err():
+				return
+			}
+		}
+	}()
+
+	// Watch for auctions ending
+	auctionEndedCh := make(chan *AuctionContractAuctionEnded)
+	auctionEndedSub, err := auctionContract.WatchAuctionEnded(nil, auctionEndedCh)
+	if err != nil {
+		fmt.Printf("Error subscribing to auction ended events: %v\n", err)
+		return
+	}
+	defer auctionEndedSub.Unsubscribe()
+	go func() {
+		for {
+			select {
+			case auctionEnded := <-auctionEndedCh:
+				// Transfer NFT to winning bidder
+				if err := transferNFT(auctionEnded.ID, auctionEnded.WinningBidder, nftContract, client); err != nil {
+					fmt.Printf("Error transferring NFT to winning bidder: %v\n", err)
+				}
+				// Transfer VirtueTokens to NFT owner
+				if err := transferVirtueTokens(auctionEnded.ID, auctionEnded.WinningBidValue, auctionEnded.NFTOwner, virtueTokenContract, client); err != nil {
+					fmt.Printf("Error transferring VirtueTokens to NFT owner: %v\n", err)
+				}
+				// Remove NFT from auction contract
+				if err := removeNFTFromAuction(auctionEnded.ID, auctionContract, client); err != nil {
+					fmt.Printf("Error removing NFT from auction contract: %v\n", err)
+				}
+			case <-auctionEndedSub.Err():
+				return
+			}
+		}
+	}()
+
+	// Wait for user input to exit
+	fmt.Println("NFT auction running. Press enter to exit.")
+	fmt.Scanln()
+}
+
+// NewNFTContract creates a new instance of the NFT contract
+func NewNFTContract(address common.Address, client *ethclient.Client) (*NFTContract, error) {
+	contract, err := NewNFTContractWithClient(address, client)
+	if err != nil {
+		return nil, err
+	}
+	return contract, nil
+}
+
+// NewVirtueTokenContract creates a new instance of the VirtueToken contract
+func NewVirtueTokenContract(address common.Address, client *ethclient.Client) (*VirtueTokenContract, error) {
+	contract, err := NewVirtueTokenContractWithClient(address, client)
+	if err != nil {
+		return nil, err
+	}
+	return contract, nil
+}
+
+// NewAuctionContract creates a new instance of the auction contract
+func NewAuctionContract(address common.Address, client *ethclient.Client) (*AuctionContract, error) {
+	contract, err := NewAuctionContractWithClient(address, client)
+	if err != nil {
+		return nil, err
+	}
+	return contract, nil
+}
+
+// addNFTToAuction adds an NFT to the auction contract
+func addNFTToAuction(nft *NFT, contract *AuctionContract, client *ethclient.Client) error {
+	// Load image from IPFS
+	image, err := ipfs.Cat(nft.ImageCID.String())
+	if err != nil {
+		return fmt.Errorf("Error loading image from IPFS: %v", err)
+	}
+
+	// Add NFT to auction contract
+	auth, err := getAuth()
+	if err != nil {
+		return fmt.Errorf("Error getting auth: %v", err)
+	}
+	if _, err := contract.AddNFT(auth, nft.ID, nft.Attributes, image, nft.Owner, nft.VirtueToken); err != nil {
+		return fmt.Errorf("Error adding NFT to auction contract: %v", err)
+	}
+	return nil
+}
+
+// updateBid updates a bid in the auction contract
+func updateBid(bid *Bid, contract *AuctionContract, client *ethclient.Client) error {
+	// Update bid in auction contract
+	auth, err := getAuth()
+	if err != nil {
+		return fmt.Errorf("Error getting auth: %v", err)
+	}
+	if _, err := contract.UpdateBid(auth, bid.ID, bid.Bidder, bid.BidValue, big.NewInt(bid.Timestamp)); err != nil {
+		return fmt.Errorf("Error updating bid: %v", err)
+	}
+	return nil
+}
+
+// transferNFT transfers an NFT to a new owner
+func transferNFT(id string, newOwner common.Address, contract *NFTContract, client *ethclient.Client) error {
+	// Transfer NFT to new owner
+	auth, err := getAuth()
+	if err != nil {
+		return fmt.Errorf("Error getting auth: %v", err)
+	}
+	if _, err := contract.Transfer(auth, id, newOwner); err != nil {
+		return fmt.Errorf("Error transferring NFT: %v", err)
+	}
+	return nil
+}
+
+// transferVirtueTokens transfers VirtueTokens to a new owner
+func transferVirtueTokens(id string, value *big.Int, newOwner common.Address, contract *VirtueTokenContract, client *ethclient.Client) error {
+	// Transfer VirtueTokens to new owner
+	auth, err := getAuth()
+	if err != nil {
+		return fmt.Errorf("Error getting auth: %v", err)
+	}
+	if _, err := contract.Transfer(auth, id, value, newOwner); err != nil {
+		return fmt.Errorf("Error transferring VirtueTokens: %v", err)
+	}
+	return nil
+}
+
+// removeNFTFromAuction removes an NFT from the auction contract
+func removeNFTFromAuction(id string, contract *AuctionContract, client *ethclient.Client) error {
+	// Remove NFT from auction contract
+	auth, err := getAuth()
+	if err != nil {
+return fmt.Errorf("Error getting auth: %v", err)
+	}
+	if _, err := contract.RemoveNFT(auth, id); err != nil {
+		return fmt.Errorf("Error removing NFT from auction contract: %v", err)
+	}
+	return nil
+}
+
+// getAuth gets the authenticated transactor for signing transactions
+func getAuth() (*bind.TransactOpts, error) {
+	// Replace with actual keystore file path and password
+	keystoreFile := "/path/to/keystore/file"
+	password := "password"
+
+	keyjson, err := ioutil.ReadFile(keystoreFile)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading keystore file: %v", err)
+	}
+	key, err := keystore.DecryptKey(keyjson, password)
+	if err != nil {
+		return nil, fmt.Errorf("Error decrypting key: %v", err)
+	}
+	return bind.NewKeyedTransactor(key.PrivateKey), nil
+}
